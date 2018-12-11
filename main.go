@@ -1,6 +1,10 @@
 package main
 
 import (
+	"errors"
+	"flag"
+	"fmt"
+	"os"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -20,7 +24,10 @@ func main() {
 
 	//var ttl int64
 	//var wait int64
-
+	if err := parseArguments(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 	info := &mgo.DialInfo{
 		Addrs:    []string{"127.0.0.1"},
 		Database: "leader",
@@ -37,55 +44,116 @@ func main() {
 	//session.DB("leader").C("lock").Create
 	// val, _ := randomHex(32)
 	// fmt.Println(val)
-	index := mgo.Index{
-		Key:         []string{"updated"},
-		ExpireAfter: 2 * time.Minute,
-	}
-	err = session.DB("leader").C("lock").EnsureIndex(index)
-	if err != nil {
-		log.Errorf("Error in creating index: %s", err)
+	// index := mgo.Index{
+	// 	Key:         []string{"updated"},
+	// 	ExpireAfter: 2 * time.Minute,
+	// }
+	// err = session.DB("leader").C("lock").EnsureIndex(index)
+	// if err != nil {
+	// 	log.Errorf("Error in creating index: %s", err)
+	// }
+
+	//go elect()
+	for {
+		leader, err := getLeader()
+		if err != nil {
+			log.Errorf("Error in fetching current leader: %s", err)
+		}
+		log.Info(name)
+		if leader.Name == "" || leader.Updated.Before(time.Now().Add(-2*time.Minute)) {
+			leaderName, err := acquireLeader(name)
+			if err != nil {
+				log.Errorf("Error while acquiring leader: %s", err)
+			}
+			log.Infof("New Leader is: %s", leaderName)
+		} else if leader.Name == name {
+			err = updateLeader(leader.Name)
+			if err != nil {
+				log.Errorf("Updating leader failed: %s", err)
+			}
+			log.Infof("Leader updated: %s", leader.Name)
+			time.Sleep(1 * time.Minute)
+		} else {
+			log.Infof("Leader is: %s", leader.Name)
+			time.Sleep(1 * time.Minute)
+		}
+
 	}
 
-	go elect()
+}
 
+func parseArguments() error {
+	flag.StringVar(&name, "name", "", "name for this node")
+
+	flag.Parse()
+
+	if name == "" {
+		return errors.New("required argument name not provided")
+	}
+
+	return nil
 }
 
 func elect() {
 	for {
 		time.Sleep(1 * time.Minute)
-		leader, err := getLeader(name)
+		leader, err := getLeader()
 		if err != nil {
 			log.Errorf("Error in fetching current leader: %s", err)
 		}
+
 		if leader.Name == "" || leader.Updated.Before(time.Now().Add(-2*time.Minute)) {
 			leaderName, err := acquireLeader(name)
 			if err != nil {
 				log.Errorf("Error while acquiring leader: %s", err)
 			}
 			log.Infof("Leader is: %s", leaderName)
+		} else {
+			err = updateLeader(leader.Name)
+			if err != nil {
+				log.Errorf("Updating leader failed: %s", err)
+			}
+			log.Infof("Leader updated: %s", leader.Name)
 		}
 
 	}
 }
 
 func acquireLeader(name string) (string, error) {
+	s := session.Copy()
+	defer s.Close()
 	l := Leader{
 		Name:    name,
 		Updated: time.Now(),
 	}
-	if err := session.DB("leader").C("lock").Insert(l); err != nil {
+	if err := s.DB("leader").C("lock").Insert(l); err != nil {
 		return "", err
 	}
 	return l.Name, nil
 }
 
-func getLeader(name string) (Leader, error) {
+func getLeader() (Leader, error) {
+	s := session.Copy()
+	defer s.Close()
 	var leader Leader
-	err := session.DB("leader").C("lock").Find(bson.M{"name": name}).Sort("updated").One(&leader)
+	err := s.DB("leader").C("lock").Find(bson.M{}).Sort("updated").One(&leader)
 	if err != nil {
 		return leader, err
 	}
 	return leader, nil
+}
+
+func updateLeader(name string) error {
+	s := session.Copy()
+	defer s.Close()
+	l := Leader{
+		Name:    name,
+		Updated: time.Now(),
+	}
+	if err := s.DB("leader").C("lock").Update(bson.M{"name": name}, l); err != nil {
+		return err
+	}
+	return nil
 }
 
 // func randomHex(n int) (string, error) {
